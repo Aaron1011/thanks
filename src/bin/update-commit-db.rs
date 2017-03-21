@@ -26,6 +26,8 @@ use slog::DrainExt;
 
 use thanks::models::Project;
 
+use std::collections::HashMap;
+
 #[derive(Debug,Deserialize)]
 struct GitHubResponse(Vec<Object>);
 
@@ -68,6 +70,8 @@ fn update_commit_db(log: &slog::Logger, project: &Project, connection: &PgConnec
     let release_ids: Vec<i32> = Release::belonging_to(project).load::<Release>(connection).unwrap()
         .iter().map(|ref release| release.id).collect();
 
+    let mut map = HashMap::new();
+
     for object in response.0 {
         info!(log, "Found commit with sha {}", object.sha);
 
@@ -81,9 +85,11 @@ fn update_commit_db(log: &slog::Logger, project: &Project, connection: &PgConnec
             },
             Err(_) => {
                 info!(log, "Creating commit {} for release {}", object.sha, master_release.version);
-                let author = thanks::authors::load_or_create(&connection, &object.commit.author.name, &object.commit.author.email);
-                // this commit will be part of master
-                thanks::commits::create(connection, &object.sha, &author, &master_release);
+                {
+                    let author = thanks::authors::load_or_create(&mut map, &connection, &object.commit.author.name, &object.commit.author.email);
+                    // this commit will be part of master
+                    thanks::commits::create(connection, &object.sha, &author, &master_release);
+                }
             },
         };
     }

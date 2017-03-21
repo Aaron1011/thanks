@@ -18,12 +18,14 @@ extern crate slog;
 extern crate slog_term;
 
 extern crate clap;
+extern crate git2;
 
 use diesel::prelude::*;
 use clap::{App, Arg};
 use slog::DrainExt;
 
-use std::process::Command;
+use std::collections::HashMap;
+use git2::Repository;
 
 fn main() {
     let matches = App::new("populate")
@@ -149,62 +151,74 @@ fn main() {
     // And create the release for all commits that are not released yet
     thanks::releases::create(&connection, "master", project.id, true);
 
-    // create most commits
-    //
-    // due to the way git works, this will not create any commits that were backported
-    // so we'll do those below
-    let git_log = Command::new("git")
-        .arg("-C")
-        .arg(path)
-        .arg("--no-pager")
-        .arg("log")
-        .arg("--use-mailmap")
-        .arg(r#"--format=%H %aE %aN"#)
-        .arg("master")
-        .output()
-        .expect("failed to execute process");
+    let repo = Repository::open(path).unwrap();
 
-    let git_log = git_log.stdout;
-    let git_log = String::from_utf8(git_log).unwrap();
-    {
-        use thanks::schema::releases::dsl::*;
-        use thanks::models::Release;
+    let mut map = HashMap::new();
 
-        // does this need an explicit order clause?
-        let first_release = releases.
-            filter(project_id.eq(project.id)).
-            first::<Release>(&connection).
-            expect("No release found!");
-
-        for log_line in git_log.split('\n') {
-            // there is a last, blank line
-            if log_line == "" {
-                continue;
-            }
-
-            let mut split = log_line.splitn(3, ' ');
-
-            let sha = split.next().unwrap();
-            let author_email = split.next().unwrap();
-            let author_name = split.next().unwrap();
-
-            info!(log, "Creating commit: {}", sha);
-
-            // We tag all commits initially to the first release. Each release will
-            // set this properly below.
-            let author = thanks::authors::load_or_create(&connection, &author_name, &author_email);
-            thanks::commits::create(&connection, &sha, &author, &first_release);
-        }
-    }
+    // assign first release
+    thanks::releases::assign_commits(&log, &repo, &mut map, "0.1", thanks::releases::get_first_commits(&repo, "0.1"), project.id, &path);
 
     // assign commits to their release
     for &(release, previous) in releases.iter() {
-        thanks::releases::assign_commits(&log, release, previous, project.id, &path);
+        thanks::releases::assign_commits(&log, &repo, &mut map, release, thanks::releases::get_commits(&repo, release, previous), project.id, &path);
     }
 
     // assign master
     let last = releases.last().unwrap().0;
-    thanks::releases::assign_commits(&log, "master", last, project.id, &path);
+    thanks::releases::assign_commits(&log, &repo, &mut map, "master", thanks::releases::get_commits(&repo, "master", last), project.id, &path);
 
     info!(log, "Done!");
 }
+
+
+/*fn create_commits(log: &Logger, mut map: AuthorCache, project: &Project, connection: &PgConnection, git_log: String, releases: &[(&str, &str)]) {
+    use thanks::schema::releases::dsl::*;
+    use thanks::models::*;
+
+
+    // does this need an explicit order clause?
+    let first_release = releases.
+        filter(project_id.eq(project.id)).
+        first::<Release>(connection).
+        expect("No release found!");
+
+    let lines = git_log.split('\n');
+    let mut commits: Vec<NewCommit> = Vec::with_capacity(lines.size_hint().1.unwrap_or(lines.size_hint().0));
+
+
+    info!(log, "Starting commits!");
+
+    for log_line in lines {
+        // there is a last, blank line
+        if log_line == "" {
+            continue;
+        }
+
+        let mut split = log_line.splitn(3, ' ');
+
+        let sha = split.next().unwrap();
+        let author_email = split.next().unwrap();
+        let author_name = split.next().unwrap();
+
+        //info!(log, "Creating commit: {}", sha);
+
+
+        // We tag all commits initially to the first release. Each release will
+        // set this properly below.
+        let author = thanks::authors::load_or_create(&mut map, &connection, &author_name, &author_email);
+        commits.push(thanks::commits::new(sha, &author, &first_release));
+    }
+
+    info!(log, "Creatd all objects!");
+
+    use thanks::schema::commits;
+
+    for chunk in commits.chunks(10_000) { // Postgresql limits us to (2^16 - 1) rows epr query
+        diesel::insert(chunk)
+            .into(commits::table)
+            .execute(connection)
+            .expect("Error with commit!");
+    }
+
+    info!(log, "Commits all done!")
+}*/

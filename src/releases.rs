@@ -1,3 +1,5 @@
+extern crate git2;
+
 use models::*;
 use schema::*;
 
@@ -13,14 +15,18 @@ use semver::Version;
 use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::error::Error;
-use std::io::prelude::*;
 use std::io::stderr;
-use std::process::Command;
 use std::str;
+use std::path::Path;
+use std::io::BufReader;
 
 use slog::Logger;
 
+use mailmap::Mailmap;
+
 use unicode_normalization::UnicodeNormalization;
+use releases::git2::Repository;
+use releases::git2::Oid;
 
 // needed for case-insensitivity
 use diesel::types::VarChar;
@@ -38,7 +44,25 @@ impl Release {
     }
 }
 
-pub fn assign_commits(log: &Logger, release_name: &str, previous_release: &str, release_project_id: i32, path: &str) {
+use std::fs::File;
+use std::io::prelude::*;
+
+fn get_mailmap(path: &str) -> Option<String> {
+    let file_path = Path::new(path).join(".mailmap");
+    if !file_path.is_file() {
+        return None;
+    }
+    let file = File::open(file_path).unwrap();
+
+    let mut buf_reader = BufReader::new(file);
+    let mut contents = String::new();
+    buf_reader.read_to_string(&mut contents).unwrap();
+    Some(contents)
+}
+
+
+
+pub fn assign_commits(log: &Logger, repo: &Repository, cache: AuthorCache, release_name: &str, commits: Vec<Oid>, release_project_id: i32, path: &str) {
     use diesel::expression::dsl::any;
     use diesel::pg::upsert::*;
 
@@ -48,26 +72,6 @@ pub fn assign_commits(log: &Logger, release_name: &str, previous_release: &str, 
 
     info!(log, "Assigning commits to release {}", release_name);
 
-    let git_log = Command::new("git")
-        .arg("-C")
-        .arg(&path)
-        .arg("--no-pager")
-        .arg("log")
-        .arg("--use-mailmap")
-        .arg(r#"--format=%H %ae %an"#)
-        .arg(&format!("{}...{}", previous_release, release_name))
-        .output()
-        .expect("failed to execute process");
-
-    if !git_log.status.success() {
-        let stdout = str::from_utf8(&git_log.stdout).unwrap();
-        let stderr = str::from_utf8(&git_log.stderr).unwrap();
-        panic!(
-            "git log failed:\n\nstdout:\n{}\n\nstderr:\n{}",
-            stdout,
-            stderr,
-        );
-    }
 
     let the_release = releases::table
         .filter(releases::version.eq(&release_name))
@@ -75,24 +79,27 @@ pub fn assign_commits(log: &Logger, release_name: &str, previous_release: &str, 
         .first::<Release>(&connection)
         .expect("could not find release");
 
-    let commits = str::from_utf8(&git_log.stdout).unwrap()
-        .split('\n')
-        .filter(|s| !s.is_empty())
-        .map(|line| {
-            let mut parts = line.splitn(3, ' ');
-            let sha_name = parts.next().unwrap();
-            let author_email = parts.next().unwrap();
-            let author_name = parts.next().unwrap();
-            (sha_name, author_email, author_name)
-        })
-        .collect::<Vec<_>>();
+    //let mut commit_refs = Vec::new();
+    let temp_commits = commits.into_iter().map(|id| {
+        let commit = repo.find_commit(id).unwrap();
+        let author = commit.author().to_owned();
+        (commit, author)
+    }).collect::<Vec<_>>();
+    let mut parsed_commits = Vec::new();
 
-    if commits.is_empty() {
+    let map_data = get_mailmap(path).unwrap_or("".to_string());
+    let mailmap = Mailmap::new(map_data.as_str());
+
+    for &(ref commit, ref author) in temp_commits.iter() {
+        let (mapped_name, mapped_email) = mailmap.map(author.name().unwrap(), author.email().unwrap());
+        parsed_commits.push((format!("{}", commit.id()), mapped_email, mapped_name));
+    }
+
+    if parsed_commits.is_empty() {
         writeln!(
             stderr(),
-            "Could not find commits between {} and {} (maybe the tag is \
+            "Could not find commits for {} (maybe the tag is \
             missing?) Skipping.",
-            previous_release,
             release_name
         ).unwrap();
         // https://github.com/diesel-rs/diesel/issues/797
@@ -100,17 +107,20 @@ pub fn assign_commits(log: &Logger, release_name: &str, previous_release: &str, 
     }
 
     connection.transaction::<_, Box<Error>, _>(|| {
-        let (shas, commits): (Vec<_>, Vec<_>) =
-            authors_by_sha(&connection, commits)?
-                .into_iter()
-                .map(|(sha, author_id)| {
-                    (sha, NewCommit {
-                        sha: sha,
+        let by_sha = authors_by_sha(cache, &connection, parsed_commits)?;
+        let (shas, commits): (Vec<_>, Vec<_>) = {
+            by_sha
+                .iter()
+                .map(|&(ref sha, author_id)| {
+                    (sha.clone(), NewCommit {
+                        sha: sha.as_str(),
                         release_id: the_release.id,
                         author_id: author_id,
                     })
                 })
-                .unzip();
+                .unzip()
+        };
+
 
         // Set the release id of any commits that already existed
         // FIXME: In Diesel 0.12 collapse this with the next line to use
@@ -133,25 +143,43 @@ pub fn assign_commits(log: &Logger, release_name: &str, previous_release: &str, 
     }).expect("Error saving commits and authors");
 }
 
-type Sha<'a> = &'a str;
-type Email<'a> = &'a str;
-type Name<'a> = &'a str;
+pub fn get_first_commits(repo: &Repository, release_name: &str) -> Vec<Oid> {
+    let mut walk = repo.revwalk().unwrap();
+    walk.push(repo.revparse(release_name).unwrap().from().unwrap().id()).unwrap();
+    walk.into_iter().map(|id| id.unwrap()).collect()
+}
+
+
+// libgit2 currently doesn't support the symmetric difference (triple dot or 'A...B') notation.
+// We replicate it using the union of 'A..B' and 'B..A'
+pub fn get_commits(repo: &Repository, release_name: &str, previous_release: &str) -> Vec<Oid> {
+    let mut walk_1 = repo.revwalk().unwrap();
+    walk_1.push_range(format!("{}..{}", previous_release, release_name).as_str()).unwrap();
+
+    let mut walk_2 = repo.revwalk().unwrap();
+    walk_2.push_range(format!("{}..{}", release_name, previous_release).as_str()).unwrap();
+
+    walk_1.into_iter().map(|id| id.unwrap()).chain(walk_2.into_iter().map(|id| id.unwrap())).collect()
+}
+
 type AuthorId = i32;
+
+use authors::AuthorCache;
 
 /// Finds or creates all authors from a git log, and returns the given shas
 /// zipped with the id of the author in the database.
-fn authors_by_sha<'a>(conn: &PgConnection, git_log: Vec<(Sha<'a>, Email, Name)>)
-    -> QueryResult<Vec<(Sha<'a>, AuthorId)>>
+fn authors_by_sha<'a, 'b, 'c>(cache: AuthorCache<'b, 'c>, conn: &PgConnection, git_log: Vec<(String, String, String)>)
+    -> QueryResult<Vec<(String, AuthorId)>>
 {
-    let new_authors = git_log.iter().map(|&(_, email, name)| {
-        NewAuthor { email: email, name: name }
+    let new_authors = git_log.iter().map(|&(_, ref email, ref name)| {
+        NewAuthor { email: email.as_str(), name: name.as_str() }
     }).collect();
-    let author_ids = ::authors::find_or_create_all(conn, new_authors)?
+    let author_ids = ::authors::find_or_create_all(cache, conn, new_authors)?
         .into_iter()
         .map(|author| ((author.email, author.name), author.id))
         .collect::<HashMap<_, _>>();
-    Ok(git_log.into_iter()
-        .map(|(sha, email, name)| (sha, author_ids[&(email.into(), name.into())]))
+    Ok(git_log.iter()
+        .map(|&(ref sha, ref email, ref name)| (sha.clone(), author_ids[&(email.clone(), name.clone())]))
         .collect())
 }
 
