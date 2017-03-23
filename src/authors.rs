@@ -16,17 +16,6 @@ pub fn load_or_create<'a, 'b>(cache: AuthorCache<'a, 'b>, conn: &PgConnection, a
     };
 
     cache.entry((author_name.to_string(), author_email.to_string())).or_insert_with(|| { find_or_create(conn, &new_author).expect("Could not find or create author")}).clone()
-
-    /*return match cache.entry(new_author) {
-        Entry::Vacant(v) => {
-            let author = find_or_create(conn, v.key()).expect("Could not find or create author");
-            v.insert(author)
-        },
-        Entry::Occupied(v) => {
-            v.into_mut()
-        }*/
-
-    //};
 }
 
 pub fn find_or_create_all<'a ,'b>(cache: AuthorCache<'a, 'b>, conn: &PgConnection, new_authors: Vec<NewAuthor<'b>>)
@@ -75,18 +64,6 @@ pub fn find_or_create_all<'a ,'b>(cache: AuthorCache<'a, 'b>, conn: &PgConnectio
     }
 
     Ok(final_authors)
-
-    /*let (names, emails): (Vec<_>, Vec<_>) = new_authors.iter()
-        .map(|author| (author.name, author.email))
-        .unzip();
-
-    insert(&new_authors.on_conflict_do_nothing())
-        .into(authors)
-        .execute(conn)?;
-
-    authors.filter(name.eq(any(names)))
-        .filter(email.eq(any(emails)))
-        .load(conn)*/
 }
 
 fn find_or_create(conn: &PgConnection, new_author: &NewAuthor) -> QueryResult<Author> {

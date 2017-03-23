@@ -80,13 +80,11 @@ fn main() {
     }
 
     // check that we have no commits
-    {
         // if there are no releases then there should be no commits as well
         // so we may skip this check
         // I consider changing release_id to NOT NULL since we assign commit
         // to the first release on creation
-    }
-
+    
     // get path to git repo
     let path = matches.value_of("filepath").unwrap();
     info!(log, "Path to project's repo: {}", path);
@@ -169,56 +167,3 @@ fn main() {
 
     info!(log, "Done!");
 }
-
-
-/*fn create_commits(log: &Logger, mut map: AuthorCache, project: &Project, connection: &PgConnection, git_log: String, releases: &[(&str, &str)]) {
-    use thanks::schema::releases::dsl::*;
-    use thanks::models::*;
-
-
-    // does this need an explicit order clause?
-    let first_release = releases.
-        filter(project_id.eq(project.id)).
-        first::<Release>(connection).
-        expect("No release found!");
-
-    let lines = git_log.split('\n');
-    let mut commits: Vec<NewCommit> = Vec::with_capacity(lines.size_hint().1.unwrap_or(lines.size_hint().0));
-
-
-    info!(log, "Starting commits!");
-
-    for log_line in lines {
-        // there is a last, blank line
-        if log_line == "" {
-            continue;
-        }
-
-        let mut split = log_line.splitn(3, ' ');
-
-        let sha = split.next().unwrap();
-        let author_email = split.next().unwrap();
-        let author_name = split.next().unwrap();
-
-        //info!(log, "Creating commit: {}", sha);
-
-
-        // We tag all commits initially to the first release. Each release will
-        // set this properly below.
-        let author = thanks::authors::load_or_create(&mut map, &connection, &author_name, &author_email);
-        commits.push(thanks::commits::new(sha, &author, &first_release));
-    }
-
-    info!(log, "Creatd all objects!");
-
-    use thanks::schema::commits;
-
-    for chunk in commits.chunks(10_000) { // Postgresql limits us to (2^16 - 1) rows epr query
-        diesel::insert(chunk)
-            .into(commits::table)
-            .execute(connection)
-            .expect("Error with commit!");
-    }
-
-    info!(log, "Commits all done!")
-}*/
